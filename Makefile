@@ -1,6 +1,6 @@
-.PHONY all clean deps compile run
+.PHONY: all clean deps compile run
 
-all: compile
+all: deps compile
 
 clean:
 	rm -f ctrie
