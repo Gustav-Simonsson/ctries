@@ -38,6 +38,7 @@
  */
 
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -47,6 +48,49 @@
 
 /* Configuration and helper macros
  *
+ */
+#define SET_ROOT_NODE(opts) (opts |= 1) // set first bit
+// set node type bits
+#define SET_NODE_TYPE(opts, type) {opts &= 241; opts |= type;} 
+#define IS_ROOT_INODE(in_opts) (in_opts & 1)
+#define CHILD_NODE(in_opts) (in_opts & 14)
+#define ROOT_INODE 1
+// node types switched on in insert/update/delete
+// integer values of bit 2-4
+#define CHILD_EMPTY 0
+#define CHILD_INODE 2
+#define CHILD_CNODE 4
+#define CHILD_LNODE 6
+#define CHILD_KVNODE 8
+#define CHILD_TOMBED_KVNODE 10
+
+// ctrie options bitmap
+#define NO_OPTS 0
+#define READONLY 1
+
+// misc internal function return codes
+#define NOTFOUND 2
+#define CONTRACTION 0
+#define NO_CONTRACTION 1
+
+#define OK 0
+#define RESTART 1
+
+// TODO: Think about which malloc to use, maybe Google's tcmalloc?
+// TODO: maybe remove assert once ctrie is properly tested and stable?
+#define CTRIE_MALLOC(n, t) ({void *x = malloc((n) * sizeof(t)); \
+                        assert(x && "Ctrie malloc failed!"); \
+                        x;})
+
+#define ZERO_ARRAY(a, size) (memset((a), 0, size * sizeof((a)[0])))
+
+// TODO: Can we benefit from a more relaxed model?
+#define CAS_MEM_BARRIER __ATOMIC_SEQ_CST
+#define CAS(ptr, expected, desired) \
+    __atomic_compare_exchange(ptr, expected, desired, false, \
+                              CAS_MEM_BARRIER, CAS_MEM_BARRIER)
+
+/*
  * See chapter 3 in [2]. We use N bits in key hash as index for which
  * branch to follow. At the first level this is bit 0 .. N-1, at the next
  * level bit N to N*2 - 1, etc.
@@ -73,8 +117,8 @@ typedef Fnv32_t ctrie_hash_t;
 
 typedef uint32_t ctrie_int_t;
 #define HASH_INDEX_LEVEL_BIT_COUNT 5
-#define HASH_INDEX_MAX_BIT_COUNT 27
-//#define HASH_INDEX_MAX_BIT_COUNT 5
+//#define HASH_INDEX_MAX_BIT_COUNT 27
+#define HASH_INDEX_MAX_BIT_COUNT 5
 #define CNODE_ARRAY_LEN 32
 typedef Fnv64_t ctrie_hash_t;
 #define HASH(key) (fnv_32a_buf(&(key), 4, 0))
@@ -82,57 +126,11 @@ typedef Fnv64_t ctrie_hash_t;
 
 #endif
 
-#define BITS_VALUE(n, bits) ({int f = (1 << bits) - 1; n & f;})
-#define BIT_AT(n, p) (n & (1 << p))
-#define BIT_SET(n, p) (n |= (1 << p))
-#define BIT_CLEAR(n, p) (n &= ~(1 << p))
-#define BIT_UPDATE(n, p, b) ((b == 0) ? BIT_CLEAR(n, p) : BIT_SET(n, p))
-
-// TODO: Think about which malloc to use, maybe Google's tcmalloc?
-// TODO: maybe remove assert once ctrie is properly tested and stable?
-#define CTRIE_MALLOC(n, t) ({void *x = malloc((n) * sizeof(t)); \
-                        assert(x && "Ctrie malloc failed!"); \
-                        x;})
-
-#define ZERO_ARRAY(a, size) (memset((a), 0, size * sizeof((a)[0])))
-
-// Debug/Dev/Test stuff
-#define PRINT_OPAQUE_STRUCT(p) //print_mem((p), sizeof(*(p)))
-
-void print_mem(void const *vp, size_t n) {
-    unsigned char const *p = vp;
-    size_t i;
-    for (i=0; i<n; i++)
-        printf("%02x ", p[i]);
-    putchar('\n');
-};
-
 /* struct definitions and struct types macros
  *
  * TODO: Optimize structs for minimal internal padding added by GCC on
  * modern x86 archs.
  */
-
-// node types switched on in insert/update/delete
-#define CHILD_EMPTY 0
-#define CHILD_INODE 1
-#define CHILD_CNODE 2
-#define CHILD_LNODE 3
-#define CHILD_KVNODE 4
-#define CHILD_TOMBED_KVNODE 5
-
-// ctrie options bitmap
-#define NO_OPTS 0
-#define READONLY 1
-
-// inode
-#define ROOT_INODE 1
-
-// misc internal function return codes
-#define NOTFOUND 2
-#define CONTRACTION 0
-#define NO_CONTRACTION 1
-
 struct ctrie
 {
     ctrie_int_t options;
@@ -141,8 +139,10 @@ struct ctrie
 
 struct inode
 {
-    char is_root;
-    char mn_type;
+    // As inode consists of one 32-bit or 64-bit int and one void pointer,
+    // it is two words in size on both 32-bit and 64-bit archs, enabling use
+    // of double-word CAS on the entire inode struct.
+    ctrie_int_t opts;
     void *mn; // Mainnode; points to either cnode or lnode
 };
 
@@ -169,6 +169,7 @@ struct lnode
  */
 ctrie_int_t compress_node(struct cnode *cn);
 ctrie_int_t delete(struct cnode *cn, ctrie_int_t kv_pos);
+ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct);
 
 /*
  * API
@@ -180,8 +181,8 @@ struct ctrie *new_ct()
     struct cnode *cn = CTRIE_MALLOC(1, struct cnode);
 
     ZERO_ARRAY(cn->branch_types, CNODE_ARRAY_LEN);
-    in->is_root = ROOT_INODE;
-    in->mn_type = CHILD_CNODE;
+    SET_ROOT_NODE(in->opts);
+    SET_NODE_TYPE(in->opts, CHILD_CNODE);
     in->mn = cn;
     ct->options = NO_OPTS;
     ct->root = in;
@@ -190,13 +191,22 @@ struct ctrie *new_ct()
 
 ctrie_int_t ct_insert(struct kvnode *kv_to_insert, struct ctrie *ct)
 {
+    int res;
+    do {
+        res = insert(kv_to_insert, ct);
+    } while (res == RESTART);
+    return 0;
+}
+
+ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct)
+{
     ctrie_hash_t key_hash;
     ctrie_int_t key_hash_bits;
     ctrie_int_t index, prev_level_index, present_kv_index;
     struct kvnode *kv;
-    struct cnode *cn, *new_cn;
-    struct inode *in, *new_in;
-    struct lnode *ln, *ln_head, *new_ln;
+    struct cnode *cn, *new_cn, cn_copy;
+    struct inode *in, *new_in, in_copy;
+    struct lnode *ln, *new_ln, *ln_head;
     ctrie_int_t child_type; // node type of node void pointer
     void *node;
 
@@ -210,19 +220,27 @@ ctrie_int_t ct_insert(struct kvnode *kv_to_insert, struct ctrie *ct)
         switch (child_type) {
         case CHILD_INODE:
             in = ((struct inode *) node);
-            node = in->mn;
-            child_type = in->mn_type;
+            in_copy = *in;
+            node = in_copy.mn;
+            child_type = CHILD_NODE(in_copy.opts);
             break;
         case CHILD_CNODE:
             cn = ((struct cnode *) node);
+            cn_copy = *cn;
             index = HASH_INDEX(key_hash, key_hash_bits);
-            node = (cn->branches)[index];
+            node = (cn_copy.branches)[index];
             key_hash_bits += HASH_INDEX_LEVEL_BIT_COUNT;
-            child_type = (cn->branch_types)[index];
+            child_type = (cn_copy.branch_types)[index];
             break;
         case CHILD_EMPTY:
-            (cn->branches)[index] = kv_to_insert;
-            cn->branch_types[index] = CHILD_KVNODE;
+            new_in = CTRIE_MALLOC(1, struct inode);
+            new_cn = CTRIE_MALLOC(1, struct cnode);
+            *new_in = in_copy;
+            *new_cn = cn_copy;
+            (new_cn->branches)[index] = kv_to_insert;
+            new_cn->branch_types[index] = CHILD_KVNODE;
+            new_in->mn = new_cn;
+            CAS(in, &in_copy, new_in);
             return 0;
         case CHILD_KVNODE:
             kv = (struct kvnode *) node;
@@ -246,7 +264,7 @@ ctrie_int_t ct_insert(struct kvnode *kv_to_insert, struct ctrie *ct)
                     new_ln->kvn = *kv;
                     new_ln->next = NULL;
                     new_in->mn = new_ln;
-                    new_in->mn_type = CHILD_LNODE;
+                    SET_NODE_TYPE(new_in->opts, CHILD_LNODE);
                     (cn->branches)[index] = new_in;
                     cn->branch_types[index] = CHILD_INODE;
                     node = new_in;
@@ -272,7 +290,7 @@ ctrie_int_t ct_insert(struct kvnode *kv_to_insert, struct ctrie *ct)
                 new_cn->branch_types[index] = CHILD_KVNODE;
                 new_cn->branch_types[present_kv_index] = CHILD_KVNODE;
                 new_in->mn = new_cn;
-                new_in->mn_type = CHILD_CNODE;
+                SET_NODE_TYPE(new_in->opts, CHILD_CNODE);
                 (cn->branches)[prev_level_index] = new_in;
                 cn->branch_types[prev_level_index] = CHILD_INODE;
                 return 0;
@@ -327,7 +345,7 @@ ctrie_int_t ct_lookup(struct kvnode *lookup_kv, struct ctrie *ct)
         case CHILD_INODE:
             in = ((struct inode *) node);
             node = in->mn;
-            child_type = in->mn_type;
+            child_type = CHILD_NODE(in->opts);
             break;
         case CHILD_CNODE:
             cn = ((struct cnode *) node);
@@ -343,7 +361,7 @@ ctrie_int_t ct_lookup(struct kvnode *lookup_kv, struct ctrie *ct)
                 return 0;
             } else {
                 printf("LOOKUP: Key not found: found kvnode not matching\n");
-                printf("kv key: %d kv value: %d lookup kv key: %d\n", kv->key, kv->value, lookup_kv->key);
+                printf("kv key: %d kv value: %d lookup kv key: %d\n", (int) kv->key, (int) kv->value, (int) lookup_kv->key);
                 return 1;
             }
             break;
@@ -392,7 +410,7 @@ ctrie_int_t ct_delete(struct kvnode *delete_kv, struct ctrie *ct)
         case CHILD_INODE:
             in = ((struct inode *) node);
             node = in->mn;
-            child_type = in->mn_type;
+            child_type = CHILD_NODE(in->opts);
             break;
         case CHILD_CNODE:
             cn = ((struct cnode *) node);
@@ -492,7 +510,7 @@ ctrie_int_t contract_node(struct cnode *parent_cn, struct cnode *cn,
         in = (struct inode *) (parent_cn->branches)[in_pos];
         new_in = *in;
         new_in.mn = (cn->branches)[kvnode_pos];
-        new_in.mn_type = CHILD_TOMBED_KVNODE;
+        SET_NODE_TYPE(new_in.opts, CHILD_TOMBED_KVNODE);
         // TODO: replace copy with CAS on in & new_in
         *in = new_in;
         // TODO: move free cn to caller, if CAS OK
@@ -515,7 +533,7 @@ ctrie_int_t compress_node(struct cnode *cn)
     for (i = 0; (i < CNODE_ARRAY_LEN); i++) {
         if (((cn->branch_types)[i]) == CHILD_INODE) {
             in = ((struct inode *) (cn->branches)[i]);
-            if (in->mn_type == CHILD_TOMBED_KVNODE) {
+            if (CHILD_NODE(in->opts) == CHILD_TOMBED_KVNODE) {
                 (cn->branch_types)[i] = CHILD_KVNODE;
                 (cn->branches)[i] = in->mn;
                 // TODO: move free to caller, if CAS was OK ?
@@ -548,12 +566,13 @@ void run_unit_tests()
     struct ctrie *ct = new_ct();
     struct kvnode *kv1;
     ctrie_int_t key_count =
-        CNODE_ARRAY_LEN *
-        CNODE_ARRAY_LEN *
-        CNODE_ARRAY_LEN *
-        CNODE_ARRAY_LEN + 1;
+        //CNODE_ARRAY_LEN *
+        //CNODE_ARRAY_LEN *
+        //CNODE_ARRAY_LEN *
+        //CNODE_ARRAY_LEN * 1 +
+        1;
 
-    printf("Insert for %d keys: ", key_count);
+    printf("Insert for %d keys: ", (int) key_count);
     ctrie_int_t i;
     ctrie_int_t n;
     for (i=0; i<key_count; i++) {
@@ -565,7 +584,7 @@ void run_unit_tests()
     }
     printf("OK\n");
 
-    printf("Lookup for %d keys: ", key_count);
+    printf("Lookup for %d keys: ", (int) key_count);
     int lookup_res = 1;
     kv1 = CTRIE_MALLOC(1, struct kvnode);
     for (i=0; i<key_count; i++) {
@@ -577,7 +596,7 @@ void run_unit_tests()
     }
     printf("OK\n");
 
-    printf("Update & Lookup for %d keys: ", key_count);
+    printf("Update & Lookup for %d keys: ", (int) key_count);
     for (i=0; i<key_count; i++) {
         kv1 = CTRIE_MALLOC(1, struct kvnode);
         kv1->key = i;
@@ -594,7 +613,7 @@ void run_unit_tests()
     }
     printf("OK\n");
 
-    printf("Delete & Lookup for %d keys: ", key_count);
+    printf("Delete & Lookup for %d keys: ", (int) key_count);
     int delete_res;
     for (i=0; i<key_count; i++) {
         kv1->key = i;

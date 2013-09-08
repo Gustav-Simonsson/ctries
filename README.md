@@ -32,10 +32,13 @@ TODO
 
 <a name='build'>
 
+Dependencies
+-----
+1. FNV hash library (included in this git repo)
+2. GCC 4.7 (for __atomic routines). GCC 4.8.1 is recommended.
+
 Build
 -----
-Currently the only dependency aside from GCC is the FNV hash library.
-It is included in this git repo.
 
 ```sh
 make compile
