@@ -1,32 +1,34 @@
 
 ctries
 ====
-A C implementation of concurrent tries with non-blocking snapshots
+C implementation of concurrent tries with non-blocking snapshots
 
 <a name='introduction'>
 
 Introduction
 ------------
 
-This is a experimental, incomplete implementation of the ctrie data structure.
-In it's current state it serves more as an exercise in learning C for
-the author than as a useful, ready-to-use data structure. Hopefully it will
+This is an experimental, incomplete implementation of the ctrie data structure.
+In it's current state it serves as an exercise for the author to learn C and is
+not useful as a ready-to-use data structure yet. Hopefully it will
 evolve into something complete and stable enough for usage in other programs!
-
 
 <a name='features'>
 
 Features
 --------
 
-  * Insertion of keys in form of 32 or 64-bit words
-  * Lookup of keys
-  * TODO: Deletion of keys
+  * Keys in form of 32 or 64-bit words
+  * Insert, update, lookup and deletion of keys
+
+TODO
+--------
+
   * TODO: Correct compression and contraction during deletion
+  * TODO: Change test malloc/free to proper memory management
   * TODO: CAS on inodes for all modifications
   * TODO: Switch CAS into GCAS to enable snapshots
   * TODO: Atomic snapshots
-
 
 <a name='build'>
 
