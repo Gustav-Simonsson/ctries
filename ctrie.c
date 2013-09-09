@@ -104,7 +104,8 @@
 
 typedef uint64_t ctrie_int_t;
 #define HASH_INDEX_LEVEL_BIT_COUNT 6
-#define HASH_INDEX_MAX_BIT_COUNT 58
+//#define HASH_INDEX_MAX_BIT_COUNT 58
+#define HASH_INDEX_MAX_BIT_COUNT 6
 #define CNODE_ARRAY_LEN 64
 // TODO: Try different hash functions and decide on optimal one for ctries
 typedef Fnv32_t ctrie_hash_t;
@@ -176,9 +177,9 @@ ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct);
 struct ctrie *new_ct()
 {
     struct ctrie *ct = CTRIE_MALLOC(1, struct ctrie);
-    struct inode *in = CTRIE_MALLOC(1, struct inode);
-    struct inode **in_ptr = CTRIE_MALLOC(1, void);
     struct cnode *cn = CTRIE_MALLOC(1, struct cnode);
+    struct inode *in = CTRIE_MALLOC(1, struct inode);
+    struct inode **in_ptr = CTRIE_MALLOC(1, struct inode *);
 
     ZERO_ARRAY(cn->branch_types, CNODE_ARRAY_LEN);
     SET_ROOT_NODE(in->opts);
@@ -214,7 +215,9 @@ ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct)
     key_hash = HASH(kv_to_insert->key);
     key_hash_bits = 0;
     index = 0;
-    node = (*((struct inode **) ct->root))->mn;
+    in = (struct inode **) ct->root;
+    in_copy = *in;
+    node = in_copy->mn;
     child_type = CHILD_CNODE;
 
     while (1) {
@@ -241,7 +244,6 @@ ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct)
             (new_cn->branches)[index] = kv_to_insert;
             new_cn->branch_types[index] = CHILD_KVNODE;
             new_in->mn = new_cn;
-            //in = new_in;
             if (CAS(in, in_copy, new_in)) {
                 return OK;
             } else {
