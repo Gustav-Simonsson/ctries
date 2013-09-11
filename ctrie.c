@@ -207,8 +207,8 @@ ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct)
     ctrie_int_t index, prev_level_index, present_kv_index;
     struct kvnode *kv;
     struct cnode *cn, *new_cn, cn_copy;
-    struct inode **in, *new_in, *in_copy;
-    struct lnode *ln, *new_ln, *ln_head;
+    struct inode **in, **in2, *new_in, *new_in2, *in_copy;
+    struct lnode *ln, *new_ln, *new_ln2, *ln_head;
     ctrie_int_t child_type;
     void *node;
 
@@ -242,11 +242,13 @@ ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct)
             new_in = in_copy;
             *new_cn = cn_copy;
             (new_cn->branches)[index] = kv_to_insert;
-            new_cn->branch_types[index] = CHILD_KVNODE;
+            (new_cn->branch_types)[index] = CHILD_KVNODE;
             new_in->mn = new_cn;
             if (CAS(in, in_copy, new_in)) {
                 return OK;
             } else {
+                free(new_cn);
+                free(new_in);
                 return RESTART;
             }
         case CHILD_KVNODE:
@@ -257,29 +259,45 @@ ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct)
             } else {
                 /* See chapter 3.3 in [2]. Full key hash collision; we cannot
                  * extend with another cnode as we are at the bottom of ctrie.
-                 * Instead, we replace the PRESENT kvnode in the ctrie
+                 * Instead, we replace the PRESENT kvnode in the cnode
                  * with a NEW inode holding a NEW lnode holding the PRESENT
-                 * kvnode. Then, we break and let the generic lnode
-                 * (traversing new inode) case handle the insertion of
-                 * the NEW kvnode into the NEW lnode.
+                 * kvnode AND the NEW kvnode
                  */
                 if (key_hash_bits > HASH_INDEX_MAX_BIT_COUNT) {
                     //printf("INSERT: full key hash coll; creating lnode\n");
                     //printf("kv key: %d kv value: %d insert kv key: %d\n", kv->key, kv->value, kv_to_insert->key);
-                    new_ln = CTRIE_MALLOC(1, struct lnode);
-                    new_in = CTRIE_MALLOC(1, struct inode);
-                    struct inode **in_ptr = CTRIE_MALLOC(1, void);
+                    new_in =   CTRIE_MALLOC(1, struct inode);
+                    new_cn =   CTRIE_MALLOC(1, struct cnode);
+                    new_in2 =  CTRIE_MALLOC(1, struct inode);
+                    in2 =      CTRIE_MALLOC(1, struct inode *);
+                    new_ln =   CTRIE_MALLOC(1, struct lnode);
+                    new_ln2 =  CTRIE_MALLOC(1, struct lnode);
+                    new_ln2->kvn = *kv_to_insert;
+                    new_ln2->next = NULL;
                     new_ln->kvn = *kv;
-                    new_ln->next = NULL;
-                    new_in->mn = new_ln;
-                    SET_NODE_TYPE(new_in->opts, CHILD_LNODE);
-                    *in_ptr = new_in;
-                    (cn->branches)[index] = in_ptr;
-                    cn->branch_types[index] = CHILD_INODE;
-                    node = in_ptr;
-                    child_type = CHILD_INODE;
-                    break;
+                    new_ln->next = new_ln2;
+                    new_in2->mn = new_ln;
+                    SET_NODE_TYPE(new_in2->opts, CHILD_LNODE);
+                    *in2 = new_in2;
+                    *new_cn = cn_copy;
+                    (new_cn->branches)[index] = in2;
+                    (new_cn->branch_types)[index] = CHILD_INODE;
+                    new_in = in_copy;
+                    new_in->mn = new_cn;
+                    //printf("INSERT: new lnode, kv_to_insert->key %d\n", (int) kv_to_insert->key);
+                    if (CAS(in, in_copy, new_in)) {
+                        return OK;
+                    } else {
+                        free(new_in);
+                        free(new_cn);
+                        free(new_in2);
+                        free(in2);
+                        free(new_ln);
+                        free(new_ln2);
+                        return RESTART;
+                    }
                 }
+                    
                 /* See chapter 3.1 in [2]. Partial key hash collision; the part
                  * of the key hash used at this level collides with PRESENT kv,
                  * and we extend the ctrie with another level in the form of a
@@ -385,13 +403,14 @@ ctrie_int_t ct_lookup(struct kvnode *lookup_kv, struct ctrie *ct)
                     lookup_kv->value = ln->kvn.value;
                     return 0;
                 } else {
+                    //printf("LOOKUP: lnode iter\n");
                     ln = ln->next;
                 }
             } while (ln != NULL);
             printf("LOOKUP: Key not found: no matching kv in lnode\n");
             return 1;
         default:
-            //printf("LOOKUP: default case hit in lookup? %d %d \n", child_type, lookup_kv->key);
+            //printf("LOOKUP: default case hit in lookup? %d %d \n", (int) child_type, (int) lookup_kv->key);
             return 1;
         }
     }
@@ -580,7 +599,7 @@ void run_unit_tests()
         //CNODE_ARRAY_LEN *
         //CNODE_ARRAY_LEN *
         //CNODE_ARRAY_LEN *
-        //CNODE_ARRAY_LEN * 1 +
+        //CNODE_ARRAY_LEN * 16 +
         1;
 
     printf("Insert for %d keys: ", (int) key_count);
