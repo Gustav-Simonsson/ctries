@@ -18,12 +18,7 @@
  *
  * 1. The implementation is mainly based on [2]. As [2] describes the algorithm
  *    in functional-style pseudo-code, with recursive helper-functions, this
- *    imperative impl will naturally read in a different way. In particular,
- *    the delete (remove) function described in chapter 3.2 [2] is quite
- *    different since it makes use of the contraction and compression functions
- *    on arbitrary number of C-nodes. Whereas in a functional impl these can be
- *    tracked by the call stack, here we keep a history of traversed nodes
- *    in a void pointer array
+ *    imperative impl will naturally read in a different way.
  *
  * 2. As some node types (structs) can point to several node types, which is
  *    only known at run-time, we make use of void pointers and track the node
@@ -31,8 +26,7 @@
  *
  * 3. The C structs composing the ctrie are named after the types and data
  *    structures described in [2], with a few exceptions: the S-node struct is
- *    named kvnode, and the tombed inode is here implemented as regular inode,
- *    with its type tracked in the above cnode.
+ *    named kvnode, and the tombed inode is implemented as TODO
  *
  * Created : 19 May 2013 by gustav <gustav.simonsson@gmail.com>
  */
@@ -45,48 +39,27 @@
 #include <assert.h>
 #include "fnv.h"
 
-/* Configuration and helper macros
- *
- */
-#define SET_ROOT_NODE(opts) (opts |= 1) // set first bit
-// set node type bits
-#define SET_NODE_TYPE(opts, type) {opts &= 241; opts |= type;} 
-#define IS_ROOT_INODE(in_opts) (in_opts & 1)
-#define CHILD_NODE(in_opts) (in_opts & 14)
 #define ROOT_INODE 1
 // node types switched on in insert/update/delete
-// integer values of bit 2-4
-#define CHILD_EMPTY 0
-#define CHILD_INODE 2
-#define CHILD_CNODE 4
-#define CHILD_LNODE 6
-#define CHILD_KVNODE 8
-#define CHILD_TOMBED_KVNODE 10
-
-// ctrie options bitmap
-#define NO_OPTS 0
-#define READONLY 1
-
-// misc internal function return codes
-#define NOTFOUND 2
-#define CONTRACTION 0
-#define NO_CONTRACTION 1
+#define GET_NODE_TYPE(options) (options & 7)
+#define SET_NODE_TYPE(options, type) {options &= 248; options |= type;}
+#define EMPTY_KVNODE 0
+#define KVNODE 1
+#define TOMBED_KVNODE 2
+#define LNODE 3
+#define CNODE 4
+#define INODE 5
 
 #define OK 0
 #define RESTART 1
+#define NOT_FOUND 2
 
 // TODO: Think about which malloc to use, maybe Google's tcmalloc?
 // TODO: maybe remove assert once ctrie is properly tested and stable?
-#define CTRIE_MALLOC(n, t) ({void *x = malloc((n) * sizeof(t)); \
-                        assert(x && "Ctrie malloc failed!"); \
-                        x;})
-
-#define ZERO_ARRAY(a, size) (memset((a), 0, size * sizeof((a)[0])))
-
-// TODO: Can we benefit from a more relaxed model?
-///#define CAS_MEM_BARRIER __ATOMIC_SEQ_CST
-//    __atomic_compare_exchange(ptr, expected, desired, false,  
-//                              CAS_MEM_BARRIER, CAS_MEM_BARRIER)
+#define CTRIE_MALLOC(n, t)         (malloc(         (n) * sizeof(t)))
+#define CTRIE_REALLOC(ptr, n, t)   (realloc(ptr,    (n) * sizeof(t)))
+#define CTRIE_MEMCPY(s1, s2, n, t) (memcpy(s1, s2,  (n) * sizeof(t)))
+#define ZERO_ARRAY(a, size)        (memset((a), 0, size * sizeof((a)[0])))
 
 /*
  * See chapter 3 in [2]. We use N bits in key hash as index for which
@@ -103,25 +76,29 @@
 #ifdef CTRIE64
 
 typedef uint64_t ctrie_int_t;
-#define HASH_INDEX_LEVEL_BIT_COUNT 6
-//#define HASH_INDEX_MAX_BIT_COUNT 58
-#define HASH_INDEX_MAX_BIT_COUNT 6
+#define HASH_INDEX_LVL_BIT_CNT 6
+//#define HASH_INDEX_MAX_BIT_CNT 58
+#define HASH_INDEX_MAX_BIT_CNT 6
 #define CNODE_ARRAY_LEN 64
 // TODO: Try different hash functions and decide on optimal one for ctries
 typedef Fnv32_t ctrie_hash_t;
 #define HASH(key) (fnv_64a_buf(&(key), 8, 0))
 #define HASH_INDEX(hash, bitcount) ((hash >> bitcount) & 63)
-#define CAS(ptr, expected, desired) \
+#define CAS(ptr, expected, desired)                        \
     __sync_bool_compare_and_swap_8((volatile void *) ptr,  \
-                                   (uint64_t) expected, \
+                                   (uint64_t) expected,    \
                                    (uint64_t) desired)
+#define SET_BRANCH_TYPES(a, n) (memcpy(a, (ctrie_int_t [64])           \
+    {n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,  \
+     n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n,n}, \
+     64*sizeof(ctrie_int_t)))
 
 #else
 
 typedef uint32_t ctrie_int_t;
-#define HASH_INDEX_LEVEL_BIT_COUNT 5
-//#define HASH_INDEX_MAX_BIT_COUNT 27
-#define HASH_INDEX_MAX_BIT_COUNT 5
+#define HASH_INDEX_LVL_BIT_CNT 5
+//#define HASH_INDEX_MAX_BIT_CNT 27
+#define HASH_INDEX_MAX_BIT_CNT 5
 #define CNODE_ARRAY_LEN 32
 typedef Fnv64_t ctrie_hash_t;
 #define HASH(key) (fnv_32a_buf(&(key), 4, 0))
@@ -137,19 +114,7 @@ typedef Fnv64_t ctrie_hash_t;
 struct ctrie
 {
     ctrie_int_t options;
-    void *root;
-};
-
-struct inode
-{
-    ctrie_int_t opts;
-    void *mn; // Mainnode; points to either cnode or lnode
-};
-
-struct cnode
-{
-    char branch_types[CNODE_ARRAY_LEN];  // inode, kvnode or tombed kvnode
-    void *branches[CNODE_ARRAY_LEN];
+    void **root;
 };
 
 struct kvnode
@@ -158,506 +123,548 @@ struct kvnode
     ctrie_int_t value;
 };
 
+struct cnode
+{
+    // TODO: maybe put inode gen in some bits in branch_type?
+    ctrie_int_t branch_types[CNODE_ARRAY_LEN];
+    struct kvnode branches[CNODE_ARRAY_LEN];
+};
+
 struct lnode
 {
-    struct kvnode kvn;
-    struct lnode *next;
+    int kvs_len;
+    struct kvnode *kvs;
 };
 
 /*
  * Forward declarations
  */
 ctrie_int_t compress_node(struct cnode *cn);
-ctrie_int_t delete(struct cnode *cn, ctrie_int_t kv_pos);
-ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct);
-
+ctrie_int_t insert(struct ctrie *ct, ctrie_int_t key, ctrie_int_t value);
+ctrie_int_t lookup(struct ctrie *ct, struct kvnode *lookup_kv);
+ctrie_int_t delete(struct ctrie *ct, struct kvnode *delete_kv);
+int delete_cn(struct cnode *cn);
 /*
  * API
  */
-struct ctrie *new_ct()
+struct ctrie *ct_new()
 {
-    struct ctrie *ct = CTRIE_MALLOC(1, struct ctrie);
-    struct cnode *cn = CTRIE_MALLOC(1, struct cnode);
-    struct inode *in = CTRIE_MALLOC(1, struct inode);
-    struct inode **in_ptr = CTRIE_MALLOC(1, struct inode *);
+    struct ctrie *ct   = CTRIE_MALLOC(1,               struct ctrie);
+    struct cnode *cn   = CTRIE_MALLOC(1,               struct cnode);
+    void **iptr        = CTRIE_MALLOC(1,               void *);
 
-    ZERO_ARRAY(cn->branch_types, CNODE_ARRAY_LEN);
-    SET_ROOT_NODE(in->opts);
-    SET_NODE_TYPE(in->opts, CHILD_CNODE);
-    in->mn = cn;
-    *in_ptr = in;
-    ct->options = NO_OPTS;
-    ct->root = in_ptr;
+    SET_BRANCH_TYPES(cn->branch_types, EMPTY_KVNODE);
+    *iptr = cn;
+    ct->root = iptr;
     return ct;
 }
 
-ctrie_int_t ct_insert(struct kvnode *kv_to_insert, struct ctrie *ct)
+int ct_delete_ct(struct ctrie *ct)
 {
-    if (insert(kv_to_insert, ct) == RESTART) {
+    struct cnode *cn;
+    int res;
+    
+    cn = (struct cnode *) *(ct->root);
+
+    res = (delete_cn(cn) == OK) ? 0 : 1;
+
+    free(ct->root);
+    free(ct);
+
+    return res;
+}
+
+int delete_cn(struct cnode *cn)
+{
+    struct cnode *cn2;
+    struct lnode *ln;
+    void **in_ptr;
+    int i;
+
+    for (i = 0; i < CNODE_ARRAY_LEN; i++) {
+        switch (cn->branch_types[i]) {
+        case CNODE:
+            //printf("CT_DELETE: cnode\n");
+            cn2 = (struct cnode *) *((void **) (cn->branches[i].key));
+            delete_cn(cn2);
+            break;
+        case EMPTY_KVNODE:
+            break;    
+        case KVNODE: // freed when the cn itself is freed
+            //printf("CT_DELETE: kvnode\n");
+            break;
+        case LNODE:
+            //printf("CT_DELETE: lnode\n");
+            in_ptr  = (void **) (cn->branches)[i].key;
+            ln = (struct lnode *) *in_ptr;
+            for (i = 0; (i < ln->kvs_len); i++) {
+                free(&(ln->kvs)[i]);
+            }
+            free(ln);
+            free(in_ptr);
+            break;
+        default:
+            printf("CT_DELETE: default\n");
+            return 1;
+        }
+    }
+    free(cn);
+    return 0;
+}    
+
+
+ctrie_int_t ct_insert(struct ctrie *ct, ctrie_int_t key, ctrie_int_t value)
+{
+    if (insert(ct, key, value) == RESTART) {
         return 1;
     } else {
         return 0;
     }
 }
 
-ctrie_int_t insert(struct kvnode *kv_to_insert, struct ctrie *ct)
+ctrie_int_t ct_lookup(struct ctrie *ct, struct kvnode *lookup_kv)
 {
-    ctrie_hash_t key_hash;
-    ctrie_int_t key_hash_bits;
-    ctrie_int_t index, prev_level_index, present_kv_index;
-    struct kvnode *kv;
-    struct cnode *cn, *new_cn, cn_copy;
-    struct inode **in, **in2, *new_in, *new_in2, *in_copy;
-    struct lnode *ln, *new_ln, *new_ln2, *ln_head;
-    ctrie_int_t child_type;
-    void *node;
+    int res = lookup(ct, lookup_kv);
+    if (res == RESTART) {
+        return 1;
+    }
+    if (res == NOT_FOUND) {
+        return 1;
+    }
+    return 0;
+}
 
-    key_hash = HASH(kv_to_insert->key);
+ctrie_int_t ct_delete_kv(struct ctrie *ct, struct kvnode *delete_kv)
+{
+    int res = delete(ct, delete_kv);
+    if (res == RESTART) {
+        return 1;
+    }
+    if (res == NOT_FOUND) {
+        return 1;
+    }
+    return 0;
+}
+
+ctrie_int_t insert(struct ctrie *ct, ctrie_int_t key, ctrie_int_t value)
+{
+    struct cnode *cn, *new_cn, *new_cn2;
+    struct kvnode *kv, *new_kvs;
+    struct lnode *ln, *new_ln;
+    void *in_copy, *new_in, **in_ptr, **new_in_ptr;
+    ctrie_hash_t key_hash;
+    ctrie_int_t key_hash_bits,
+        index, prev_lvl_index, present_kv_index,
+        node_type;
+    bool ln_update;
+    int i;
+
+    key_hash = HASH(key);
     key_hash_bits = 0;
     index = 0;
-    in = (struct inode **) ct->root;
-    in_copy = *in;
-    node = in_copy->mn;
-    child_type = CHILD_CNODE;
+    node_type = CNODE;
 
     while (1) {
-        switch (child_type) {
-        case CHILD_INODE:
-            in = ((struct inode **) node);
-            in_copy = *in;
-            node = in_copy->mn;
-            child_type = CHILD_NODE(in_copy->opts);
+        switch (node_type) {
+        case CNODE:
+            in_ptr         = key_hash_bits == 0 ? ct->root :
+            (void  **) (cn->branches)[index].key;
+            in_copy        = *in_ptr;
+            cn             = (struct cnode *) in_copy;
+            index          = HASH_INDEX(key_hash, key_hash_bits);
+            node_type      = GET_NODE_TYPE((cn->branch_types)[index]);
+            key_hash_bits += HASH_INDEX_LVL_BIT_CNT;
             break;
-        case CHILD_CNODE:
-            cn = ((struct cnode *) node);
-            cn_copy = *cn;
-            index = HASH_INDEX(key_hash, key_hash_bits);
-            node = (cn->branches)[index];
-            key_hash_bits += HASH_INDEX_LEVEL_BIT_COUNT;
-            child_type = (cn->branch_types)[index];
-            break;
-        case CHILD_EMPTY:
+        case EMPTY_KVNODE:
             new_cn = CTRIE_MALLOC(1, struct cnode);
-            new_in = CTRIE_MALLOC(1, struct inode);
-            new_in = in_copy;
-            *new_cn = cn_copy;
-            (new_cn->branches)[index] = kv_to_insert;
-            (new_cn->branch_types)[index] = CHILD_KVNODE;
-            new_in->mn = new_cn;
-            if (CAS(in, in_copy, new_in)) {
+            new_in = CTRIE_MALLOC(1, void *);
+
+            *new_cn   = *cn;
+            kv        = (struct kvnode *) &(new_cn->branches)[index];
+            kv->key   = key;
+            kv->value = value;
+            SET_NODE_TYPE((new_cn->branch_types)[index], KVNODE);
+            new_in = (void *) new_cn;
+            if (CAS(in_ptr, in_copy, new_in)) {
+                //free(&in_copy);
+                free(cn);
                 return OK;
             } else {
                 free(new_cn);
                 free(new_in);
                 return RESTART;
             }
-        case CHILD_KVNODE:
-            kv = (struct kvnode *) node;
-            if (kv->key == kv_to_insert->key) { // key exists in ctrie; update
-                kv->value = kv_to_insert->value;
-                return 0;
+        case KVNODE:
+            kv = (struct kvnode *) &(cn->branches)[index];
+            if (kv->key == key && kv->value == value) {
+                return OK; // only one value for each key
+            }
+            // Whether we do a update or create new cnode or lnode,
+            // we always need a new cn and in for CAS
+            new_cn = CTRIE_MALLOC(1, struct cnode);
+            new_in = CTRIE_MALLOC(1, void *);
+            *new_cn = *cn;
+            kv = (struct kvnode *) &(new_cn->branches)[index];
+            if (kv->key == key) { // update
+                kv->value = value;
+                new_in = (void *) new_cn;
+                if (CAS(in_ptr, in_copy, new_in)) {
+                    free(cn);
+                    return OK;
+                } else {
+                    free(new_cn);
+                    free(new_in);
+                    return RESTART;
+                }
             } else {
-                /* See chapter 3.3 in [2]. Full key hash collision; we cannot
-                 * extend with another cnode as we are at the bottom of ctrie.
-                 * Instead, we replace the PRESENT kvnode in the cnode
-                 * with a NEW inode holding a NEW lnode holding the PRESENT
-                 * kvnode AND the NEW kvnode
-                 */
-                if (key_hash_bits > HASH_INDEX_MAX_BIT_COUNT) {
-                    //printf("INSERT: full key hash coll; creating lnode\n");
-                    //printf("kv key: %d kv value: %d insert kv key: %d\n", kv->key, kv->value, kv_to_insert->key);
-                    new_in =   CTRIE_MALLOC(1, struct inode);
-                    new_cn =   CTRIE_MALLOC(1, struct cnode);
-                    new_in2 =  CTRIE_MALLOC(1, struct inode);
-                    in2 =      CTRIE_MALLOC(1, struct inode *);
-                    new_ln =   CTRIE_MALLOC(1, struct lnode);
-                    new_ln2 =  CTRIE_MALLOC(1, struct lnode);
-                    new_ln2->kvn = *kv_to_insert;
-                    new_ln2->next = NULL;
-                    new_ln->kvn = *kv;
-                    new_ln->next = new_ln2;
-                    new_in2->mn = new_ln;
-                    SET_NODE_TYPE(new_in2->opts, CHILD_LNODE);
-                    *in2 = new_in2;
-                    *new_cn = cn_copy;
-                    (new_cn->branches)[index] = in2;
-                    (new_cn->branch_types)[index] = CHILD_INODE;
-                    new_in = in_copy;
-                    new_in->mn = new_cn;
-                    //printf("INSERT: new lnode, kv_to_insert->key %d\n", (int) kv_to_insert->key);
-                    if (CAS(in, in_copy, new_in)) {
+                if (key_hash_bits <= HASH_INDEX_MAX_BIT_CNT) {
+                    /* See chapter 3.1 in [2]. Partial key hash collision; the part
+                     * of the key hash used at this level collides with PRESENT kv,
+                     * and we extend the ctrie with another level in the form of a
+                     * NEW cnode. We put both PRESENT and NEW kvnode in the
+                     * NEW cnode, and update ptr to PRESENT kvnode to NEW cnode.
+                     */
+                    new_in_ptr = CTRIE_MALLOC(1,               void **);
+                    new_cn2    = CTRIE_MALLOC(1,               struct cnode);
+                    SET_BRANCH_TYPES(new_cn2->branch_types, EMPTY_KVNODE);
+
+                    prev_lvl_index   = index;
+                    present_kv_index = HASH_INDEX(HASH(kv->key), key_hash_bits);
+                    index            = HASH_INDEX(key_hash, key_hash_bits);
+
+                    (new_cn2->branches)[index].key = key;
+                    (new_cn2->branches)[index].value = value;
+                    SET_NODE_TYPE((new_cn2->branch_types)[index], KVNODE);
+
+                    (new_cn2->branches)[present_kv_index] = *kv;
+                    SET_NODE_TYPE((new_cn2->branch_types)[present_kv_index],
+                                  KVNODE);
+
+                    *new_in_ptr = (void *) new_cn2;
+                    (new_cn->branches)[prev_lvl_index].key =
+                        (ctrie_int_t) new_in_ptr;
+                    SET_NODE_TYPE((new_cn->branch_types)[prev_lvl_index],
+                                  CNODE);
+                    new_in = (void *) new_cn;
+                    if (CAS(in_ptr, in_copy, new_in)) {
+                        free(cn);
                         return OK;
                     } else {
-                        free(new_in);
                         free(new_cn);
-                        free(new_in2);
-                        free(in2);
+                        free(new_cn2);
+                        free(new_in);
+                        free(new_in_ptr);
+                        return RESTART;
+                    }
+                } else {
+                    /* See chapter 3.3 in [2]. Full key hash collision; we cannot
+                     * extend with another cnode as we are at the bottom of ctrie.
+                     * Instead, we replace the present kvnode in the cnode
+                     * with a new lnode holding the present AND new kvnode
+                     */
+                    new_in_ptr = CTRIE_MALLOC(1,  void **);
+                    new_ln     = CTRIE_MALLOC(1,  struct lnode);
+                    new_kvs =    CTRIE_MALLOC(2,  struct kvnode);
+
+                    new_kvs[0]                = *kv;
+                    new_kvs[1].key            = key;
+                    new_kvs[1].value          = value;
+                    new_ln->kvs               = new_kvs;
+                    new_ln->kvs_len           = 2;
+                    *new_in_ptr               = (void *) new_ln;
+                    (new_cn->branches)[index].key = (ctrie_int_t) new_in_ptr;
+                    SET_NODE_TYPE((new_cn->branch_types)[index], LNODE);
+                    new_in = (void *) new_cn;
+
+                    if (CAS(in_ptr, in_copy, new_in)) {
+                        free(cn);
+                        return OK;
+                    } else {
+                        free(new_cn);
+                        free(new_in);
+                        free(new_in_ptr);
                         free(new_ln);
-                        free(new_ln2);
                         return RESTART;
                     }
                 }
-                    
-                /* See chapter 3.1 in [2]. Partial key hash collision; the part
-                 * of the key hash used at this level collides with PRESENT kv,
-                 * and we extend the ctrie with another level in the form of a
-                 * NEW inode holding a NEW cnode. We put both PRESENT and NEW
-                 * kvnode in the NEW cnode, and replace ptr to PRESENT kvnode
-                 * with ptr to NEW inode.
-                 */
-                //printf("INSERT: partial key hash coll; creating i and cnode\n");
-                new_cn = CTRIE_MALLOC(1, struct cnode);
-                new_in = CTRIE_MALLOC(1, struct inode);
-                struct inode **in_ptr = CTRIE_MALLOC(1, void);
-                prev_level_index = index;
-                present_kv_index = HASH_INDEX(HASH(kv->key), key_hash_bits);
-                index = HASH_INDEX(key_hash, key_hash_bits);
-                ZERO_ARRAY(new_cn->branch_types, CNODE_ARRAY_LEN);
-                (new_cn->branches)[index] = kv_to_insert;
-                (new_cn->branches)[present_kv_index] = kv;
-                new_cn->branch_types[index] = CHILD_KVNODE;
-                new_cn->branch_types[present_kv_index] = CHILD_KVNODE;
-                new_in->mn = new_cn;
-                SET_NODE_TYPE(new_in->opts, CHILD_CNODE);
-                *in_ptr = new_in;
-                (cn->branches)[prev_level_index] = in_ptr;
-                cn->branch_types[prev_level_index] = CHILD_INODE;
-                return 0;
             }
-        case CHILD_LNODE:
-            ln = ln_head = (struct lnode *) node;
-            do {
-                if (ln->kvn.key == kv_to_insert->key) {
-                    //printf("INSERT: updating lnode\n");
-                    ln->kvn.value = kv_to_insert->value; // insert becomes update
-                    return 0;
-                } else {
-                    ln = ln->next;
-                }
-            } while (ln != NULL);
-            // No matching key in lnode found for update; extend lnode.
-            //printf("INSERT: extending lnode\n");
-            //printf("insert kv key/value: %d %d\n", kv_to_insert->key, kv_to_insert->value);
+        case LNODE:
+            in_ptr  = (void **) (cn->branches)[index].key;
+            in_copy = *in_ptr;
+            ln      = (struct lnode *) in_copy;
+
+            new_in = CTRIE_MALLOC(1, void *);
             new_ln = CTRIE_MALLOC(1, struct lnode);
-            new_ln->kvn = *kv_to_insert;
-            new_ln->next = ln_head;
-            (*in)->mn = new_ln;
-            return 0;
+            new_kvs = CTRIE_MALLOC(ln->kvs_len, struct kvnode);
+
+            CTRIE_MEMCPY(new_kvs, ln->kvs, ln->kvs_len, struct kvnode);
+            new_ln->kvs     = new_kvs;
+            new_ln->kvs_len = ln->kvs_len;
+            ln_update       = false;
+
+            for (i = 0; (i < new_ln->kvs_len); i++) {
+                if ((new_ln->kvs)[i].key == key) {
+                    //printf("INSERT: updating lnode\n");
+                    (new_ln->kvs)[i].value = value; // update
+                    ln_update = true;
+                }
+            }
+            // No matching key in lnode found for update; extend lnode.
+            //printf("insert kv key/value: %d %d\n", kv_to_insert->key, kv_to_insert->value);
+            if (!ln_update) {
+                new_ln->kvs_len++;
+                new_ln->kvs = CTRIE_REALLOC(new_ln->kvs, new_ln->kvs_len,
+                                            struct kvnode);
+                (new_ln->kvs)[new_ln->kvs_len - 1].key   = key;
+                (new_ln->kvs)[new_ln->kvs_len - 1].value = value;
+            }
+            new_in = (void *) new_ln;
+            if (CAS(in_ptr, in_copy, new_ln)) {
+                //for (i = 0; i < ln->kvs_len; i++) {
+                //free((ln->kvs[i]));
+                //}
+                free(ln->kvs);
+                free(ln);
+                return OK;
+            } else {
+                // TODO: frees
+                return RESTART;
+            }
         default:
-            printf("TODO: default case hit in insert?\n\n");
             return 1;
         }
     }
 }
 
-// TODO: extract traversal from insert/lookup/delete into one traversal fun?
-ctrie_int_t ct_lookup(struct kvnode *lookup_kv, struct ctrie *ct)
+ctrie_int_t lookup(struct ctrie *ct, struct kvnode *lookup_kv)
 {
-    ctrie_hash_t key_hash;
-    ctrie_int_t key_hash_bits;
-    ctrie_int_t index;
-    struct kvnode *kv;
     struct cnode *cn;
-    struct inode *in;
+    struct kvnode *kv;
     struct lnode *ln;
-    ctrie_int_t child_type; // node type of node void pointer
-    void *node;
+    void *in_copy, **in_ptr;
+    ctrie_hash_t key_hash;
+    ctrie_int_t key_hash_bits, index, node_type;
+    int i;
 
     key_hash = HASH(lookup_kv->key);
     key_hash_bits = 0;
     index = 0;
-    node = (*((struct inode **) ct->root))->mn;
-    child_type = CHILD_CNODE;
+    node_type = CNODE;
 
     while (1) {
-        switch (child_type) {
-        case CHILD_INODE:
-            in = *((struct inode **) node);
-            node = in->mn;
-            child_type = CHILD_NODE(in->opts);
+        switch (node_type) {
+        case CNODE:
+            in_ptr         = key_hash_bits == 0 ?
+                                 ct->root :
+                                 (void  **) (cn->branches)[index].key;
+            in_copy        = *in_ptr;
+            cn             = (struct cnode *) in_copy;
+            index          = HASH_INDEX(key_hash, key_hash_bits);
+            node_type      = GET_NODE_TYPE((cn->branch_types)[index]);
+            key_hash_bits += HASH_INDEX_LVL_BIT_CNT;
             break;
-        case CHILD_CNODE:
-            cn = ((struct cnode *) node);
-            index = HASH_INDEX(key_hash, key_hash_bits);
-            node = (cn->branches)[index];
-            child_type = (cn->branch_types)[index];
-            key_hash_bits += HASH_INDEX_LEVEL_BIT_COUNT;
-            break;
-        case CHILD_KVNODE:
-            kv = (struct kvnode *) node;
+        case EMPTY_KVNODE:
+            return NOT_FOUND;
+        case KVNODE:
+            kv = (struct kvnode *) &(cn->branches)[index];
             if (kv->key == lookup_kv->key) {
                 lookup_kv->value = kv->value;
-                return 0;
+                return OK;
             } else {
-                printf("LOOKUP: Key not found: found kvnode not matching\n");
-                printf("kv key: %d kv value: %d lookup kv key: %d\n", (int) kv->key, (int) kv->value, (int) lookup_kv->key);
-                return 1;
+                return NOT_FOUND;
             }
-            break;
-        case CHILD_LNODE:
-            ln = (struct lnode *) node;
-            do {
-                if (ln->kvn.key == lookup_kv->key) {
-                    //printf("LOOKUP: Key found in lnode\n");
-                    //printf("kv key: %d kv value: %d lookup kv key: %d\n", ln->kvn.key, ln->kvn.value, lookup_kv->key);
-                    lookup_kv->value = ln->kvn.value;
-                    return 0;
-                } else {
-                    //printf("LOOKUP: lnode iter\n");
-                    ln = ln->next;
+        case LNODE:
+            in_ptr  = (void **) (cn->branches)[index].key;
+            in_copy = *in_ptr;
+            ln = (struct lnode *) in_copy;
+            for (i = 0; (i < ln->kvs_len); i++) {
+                if ((ln->kvs)[i].key == lookup_kv->key) {
+                    lookup_kv->value = (ln->kvs)[i].value;
+                    return OK;
                 }
-            } while (ln != NULL);
-            printf("LOOKUP: Key not found: no matching kv in lnode\n");
-            return 1;
+            }
+            return NOT_FOUND;
         default:
-            //printf("LOOKUP: default case hit in lookup? %d %d \n", (int) child_type, (int) lookup_kv->key);
-            return 1;
+            return NOT_FOUND;
         }
     }
 }
 
-// TODO: extract traversal from insert/lookup/delete into one traversal fun?
-ctrie_int_t ct_delete(struct kvnode *delete_kv, struct ctrie *ct)
+ctrie_int_t delete(struct ctrie *ct, struct kvnode *delete_kv)
 {
-    ctrie_hash_t key_hash;
-    ctrie_int_t key_hash_bits;
-    ctrie_int_t index;
+    struct cnode *cn, *new_cn;
     struct kvnode *kv;
-    struct cnode *cn;
-    struct inode *in;
-    struct lnode *ln, *ln_head, *ln_prev;
-    ctrie_int_t child_type;
-    void *node;
+    struct lnode *ln;
+    void *in_copy, *in_copy2, *new_in, **in_ptr, **in_ptr2;
+    ctrie_hash_t key_hash;
+    ctrie_int_t key_hash_bits, index, node_type;
+    int i;
 
     key_hash = HASH(delete_kv->key);
     key_hash_bits = 0;
     index = 0;
-    node = (*((struct inode **) ct->root))->mn;
-    child_type = CHILD_CNODE;
+    node_type = CNODE;
 
     while (1) {
-        switch (child_type) {
-        case CHILD_INODE:
-            in = *((struct inode **) node);
-            node = in->mn;
-            child_type = CHILD_NODE(in->opts);
+        switch (node_type) {
+        case CNODE:
+            in_ptr         = key_hash_bits == 0 ?
+                                 ct->root :
+                                 (void  **) (cn->branches)[index].key;
+            in_copy        = *in_ptr;
+            cn             = (struct cnode *) in_copy;
+            index          = HASH_INDEX(key_hash, key_hash_bits);
+            node_type      = GET_NODE_TYPE((cn->branch_types)[index]);
+            key_hash_bits += HASH_INDEX_LVL_BIT_CNT;
             break;
-        case CHILD_CNODE:
-            cn = ((struct cnode *) node);
-            index = HASH_INDEX(key_hash, key_hash_bits);
-            node = (cn->branches)[index];
-            child_type = (cn->branch_types)[index];
-            key_hash_bits += HASH_INDEX_LEVEL_BIT_COUNT;
-            break;
-        case CHILD_KVNODE:
-            kv = (struct kvnode *) node;
+        case EMPTY_KVNODE:
+            return NOT_FOUND;
+        case KVNODE:
+            kv = (struct kvnode *) &(cn->branches)[index];
             if (kv->key == delete_kv->key) {
-                delete(cn, index);
-                return 0;
-            } else {
-                printf("Delete: Key not found: found kvnode not matching\n");
-                return 1;
-            }
-            break;
-        case CHILD_LNODE:
-            ln = ln_prev = ln_head = (struct lnode *) node;
-            do {
-                if (ln->kvn.key == delete_kv->key) {
-                    // lnode has 2 kvs; delete kv and move remaining kv upstairs
-                    if (ln == ln_head && ln->next->next == NULL) {
-                        (cn->branch_types)[index] = CHILD_KVNODE;
-                        kv = (struct kvnode *) &((struct lnode *) ln->next)->kvn;
-                        (cn->branches)[index] = kv;
-                        free(ln);
-                        free(in);
-                        return 0;
-                    }
-                    if (ln_head->next == ln && ln->next == NULL) {
-                        (cn->branch_types)[index] = CHILD_KVNODE;
-                        kv = (struct kvnode *) &(ln_head->kvn);
-                        (cn->branches)[index] = kv;
-                        free(ln);
-                        free(in);
-                        return 0;
-                    }
-                    // lnode has 3 kvs; delete kv and retain lnode
-                    ln_prev->next = ln->next;
-                    free(ln);
-                    return 0;
+                new_cn = CTRIE_MALLOC(1, struct cnode);
+                new_in = CTRIE_MALLOC(1, void *);
+
+                *new_cn = *cn;
+                SET_NODE_TYPE((new_cn->branch_types)[index], EMPTY_KVNODE);
+                delete_kv->value = kv->value;
+                new_in = (void *) new_cn;
+                if (CAS(in_ptr, in_copy, new_in)) {
+                    free(cn);
+                    return OK;
                 } else {
-                    ln_prev = ln;
-                    ln = ln->next;
+                    free(new_cn);
+                    free(new_in);
+                    return RESTART;
                 }
-            } while (ln != NULL);
-            printf("Delete: Key not found: no matching kv in lnode\n");
-            return 1;
-        default:
-            printf("Delete: TODO: default case hit? wtf?\n\n");
-            return 1;
-        }
-    }
-}
-
-/*
- * Internal functions
- */
-ctrie_int_t delete(struct cnode *cn,
-                   ctrie_int_t kv_pos)
-{
-    struct cnode *new_cn;
-    //struct inode *in;
-    struct kvnode *kv;
-
-    new_cn = CTRIE_MALLOC(1, struct cnode);
-    *new_cn = *cn;
-    kv = ((struct kvnode *) (new_cn->branches)[kv_pos]);
-    (new_cn->branch_types)[kv_pos] = CHILD_EMPTY;
-    // TODO: move free when changing to CAS
-    free(kv);
-    // TODO: Use CAS and return RESTART on failed CAS
-    *cn = *new_cn;
-    return 0;
-}
-
-ctrie_int_t contract_node(struct cnode *parent_cn, struct cnode *cn,
-                          ctrie_int_t in_pos)
-{
-    struct inode *in;
-    struct inode new_in;
-    int i, non_kvnode_count, kvnode_pos;
-
-    non_kvnode_count = 0;
-    kvnode_pos = 0;
-
-    for (i = 0; (i < CNODE_ARRAY_LEN); i++) {
-        if (((cn->branch_types)[i]) == CHILD_KVNODE) {
-            kvnode_pos = i;
-        } else {
-            non_kvnode_count++;
-        }
-    }
-    if (non_kvnode_count == (CNODE_ARRAY_LEN - 1)) {
-        in = (struct inode *) (parent_cn->branches)[in_pos];
-        new_in = *in;
-        new_in.mn = (cn->branches)[kvnode_pos];
-        SET_NODE_TYPE(new_in.opts, CHILD_TOMBED_KVNODE);
-        // TODO: replace copy with CAS on in & new_in
-        *in = new_in;
-        // TODO: move free cn to caller, if CAS OK
-        free(cn);
-        return CONTRACTION;
-    }
-    return NO_CONTRACTION;
-}
-
-ctrie_int_t compress_node(struct cnode *cn)
-{
-    struct cnode new_cn;
-    struct inode *in;
-    int i;
-    int compress_count;
-
-    new_cn = *cn;
-    compress_count = 0;
-
-    for (i = 0; (i < CNODE_ARRAY_LEN); i++) {
-        if (((cn->branch_types)[i]) == CHILD_INODE) {
-            in = ((struct inode *) (cn->branches)[i]);
-            if (CHILD_NODE(in->opts) == CHILD_TOMBED_KVNODE) {
-                (cn->branch_types)[i] = CHILD_KVNODE;
-                (cn->branches)[i] = in->mn;
-                // TODO: move free to caller, if CAS was OK ?
-                free(in);
-                compress_count++;
+            } else {
+                printf("DELETE: Key not found: found kvnode not matching\n");
+                return NOT_FOUND;
             }
+        case LNODE:
+            in_ptr2  = (void **) (cn->branches)[index].key;
+            in_copy2 = *in_ptr2;
+            ln = (struct lnode *) in_copy2;
+            for (i = 0; (i < ln->kvs_len); i++) {
+                if ((ln->kvs)[i].key == delete_kv->key) {
+                    new_in = CTRIE_MALLOC(1, void *);
+                    delete_kv->value = (ln->kvs)[i].value;
+                    if (ln->kvs_len > 2) {
+                        // Copy struct mem instead of pointer?
+                        (ln->kvs)[i] = (ln->kvs)[ln->kvs_len - 1];
+                        ln->kvs_len--;
+                        new_in = (void *) ln;
+                        if (CAS(in_ptr2, in_copy2, new_in)) {
+                            //free(&(ln->kvs)[ln->kvs_len]);
+                            return OK;
+                        } else {
+                            free(new_in);
+                            return RESTART;
+                        }
+                    } else {
+                        new_cn = CTRIE_MALLOC(1, struct cnode);
+                        *new_cn = *cn;
+                        i = i == 1 ? 0 : 1;
+                        (new_cn->branches)[index].key   = (ln->kvs)[i].key;
+                        (new_cn->branches)[index].value = (ln->kvs)[i].value;
+                        SET_NODE_TYPE((new_cn->branch_types)[index], KVNODE);
+                        new_in = (void *) new_cn;
+                        if (CAS(in_ptr, in_copy, new_in)) {
+                            //i = i == 1 ? 1 : 0;
+                            //free(ln->kvs)[i]);
+                            free(cn);
+                            free(ln);
+                            free(in_ptr2);
+                            return OK;
+                        } else {
+                            free(new_cn);
+                            free(new_in);
+                            return RESTART;
+                        }
+                    }
+                }
+            }
+            printf("Delete: Key not found: no matching kv in lnode\n");
+            //printf("DELETE: %d %d\n", (int) key, (int) in_ptr);
+            return NOT_FOUND;
+        default:
+            printf("DELETE: default case hit in delete? %d %d \n",
+                   (int) node_type, (int) delete_kv->key);
+            return NOT_FOUND;
         }
     }
-    if (compress_count > 0) {
-        // TODO: Use CAS and return RESTART on failed CAS
-        *cn = new_cn;
-    }
-    return 0;
 }
-
-//ctrie_int_t delete_and_contract(struct inode *in, struct kvnode *kv,
-//                              ctrie_int_t pos)
-//{
-    //struct cnode new_cn;
-//  return 0;
-//}
 
 /*
  * Tests
  */
 void run_unit_tests()
 {
+    //     printf("DEBUG 6\n");
     printf("\nRunning unit tests:\n\n");
 
-    struct ctrie *ct = new_ct();
-    struct kvnode *kv1;
+    struct ctrie *ct = ct_new();
+    struct kvnode *kv1 = CTRIE_MALLOC(1, struct kvnode);
+
     ctrie_int_t key_count =
         //CNODE_ARRAY_LEN *
         //CNODE_ARRAY_LEN *
-        //CNODE_ARRAY_LEN *
-        //CNODE_ARRAY_LEN * 16 +
+        CNODE_ARRAY_LEN *
+        CNODE_ARRAY_LEN * 16 +
         1;
-
     printf("Insert for %d keys: ", (int) key_count);
-    ctrie_int_t i;
-    ctrie_int_t n;
+    ctrie_int_t key, value, i;
+    int res;
     for (i=0; i<key_count; i++) {
-        kv1 = CTRIE_MALLOC(1, struct kvnode);
-        kv1->key = i;
-        kv1->value = (i * 2) + 100;
-        n = ct_insert(kv1, ct);
-        assert(n == 0);
+        key = i;
+        value = (i * 2) + 100;
+        res = ct_insert(ct, key, value);
+        assert(res == 0);
     }
     printf("OK\n");
 
     printf("Lookup for %d keys: ", (int) key_count);
-    int lookup_res = 1;
-    kv1 = CTRIE_MALLOC(1, struct kvnode);
     for (i=0; i<key_count; i++) {
         kv1->key = i;
-        lookup_res = ct_lookup(kv1, ct);
+        res = ct_lookup(ct, kv1);
         //printf("Unit tests: lookup kv1 key, value: %d, %d \n ", kv1->key, kv1->value);
-        assert(lookup_res == 0);
+        assert(res == 0);
         assert(kv1->value == (i * 2) + 100);
     }
     printf("OK\n");
-
     printf("Update & Lookup for %d keys: ", (int) key_count);
     for (i=0; i<key_count; i++) {
         kv1 = CTRIE_MALLOC(1, struct kvnode);
-        kv1->key = i;
-        kv1->value = (i * 3) + 222;
-        n = ct_insert(kv1, ct);
-        assert(n == 0);
+        key = i;
+        value = (i * 3) + 222;
+        res = ct_insert(ct, key, value);
+        assert(res == 0);
     }
     for (i=0; i<key_count; i++) {
         kv1->key = i;
-        lookup_res = ct_lookup(kv1, ct);
+        res = ct_lookup(ct, kv1);
         //printf("Unit tests: lookup kv1 key, value: %d, %d \n ", kv1->key, kv1->value);
-        assert(lookup_res == 0);
+        assert(res == 0);
         assert(kv1->value == (i * 3) + 222);
     }
     printf("OK\n");
-
     printf("Delete & Lookup for %d keys: ", (int) key_count);
-    int delete_res;
     for (i=0; i<key_count; i++) {
         kv1->key = i;
-        delete_res = ct_delete(kv1, ct);
-        assert(delete_res == 0);
+        res = ct_delete_kv(ct, kv1);
+        assert(res == 0);
         //assert(kv1->value != (i * 3) + 222);
     }
     for (i=0; i<key_count; i++) {
         kv1->key = i;
-        lookup_res = ct_lookup(kv1, ct);
-        assert(lookup_res != 0);
+        res = ct_lookup(ct, kv1);
+        assert(res != 0);
     }
-    printf("OK\n");
 
+    res = ct_delete_ct(ct);
+    assert(res == 0);
+    free(kv1);
+    printf("OK\n");
     printf("\nEnd unit tests\n");
 }
 
